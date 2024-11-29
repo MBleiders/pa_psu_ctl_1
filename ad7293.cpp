@@ -440,9 +440,9 @@ int ad7293_reset(struct ad7293_dev *dev)
 {
 
     ad_reset(0);
-		no_os_mdelay(10);
+		no_os_mdelay(100);
     ad_reset(1);
-		no_os_mdelay(10);
+		no_os_mdelay(100);
 
 	// if (dev->gpio_reset) {
 	// 	no_os_gpio_direction_output(dev->gpio_reset, NO_OS_GPIO_LOW);
