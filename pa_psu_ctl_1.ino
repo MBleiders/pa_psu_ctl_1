@@ -12,13 +12,16 @@
 #define LED1_PIN 0
 #define LED2_PIN 1
 #define PSU_EN_PIN 2
+#define PSU_PG_PIN 3
+#define FAN_CTL_PIN 4
+#define PREAMP_CTL_PIN 5
 
 #define TEMP_SENSOR_PIN 26 //ADC0
 
 struct ad7293_dev* ad7293_obj;
 uint16_t data_val;
 
-float taget_amps = 1.0;
+float taget_amps = 2.0;
 float rs0_volts;
 float isense0_amps, isense1_amps;
 float Ug0_volts, Ug1_volts;
@@ -28,8 +31,49 @@ uint16_t rsx_alerts;
 int ad_monitoring_halt = 1;
 int open_loop_mode = 0;
 int pa_on_state = 0;
+int psu_pg_state = 0;
+float temperature_degC = 0;
 ////////////////////////////////////////////
+void psu_en(uint8_t en_state){
+  if(en_state){
+    digitalWrite(PSU_EN_PIN, HIGH);
 
+    while(digitalRead(PSU_PG_PIN) == LOW){
+      delay(100); 
+      Serial.printf("Enabling the PSU...\n"); 
+    }
+  }else{
+    digitalWrite(PSU_EN_PIN, LOW);
+
+    while(digitalRead(PSU_PG_PIN) == HIGH){
+      delay(100); 
+      Serial.printf("Disabling the PSU...\n"); 
+    }
+  }
+
+}
+
+void fan_en(uint8_t en_state){
+  if(en_state){
+    digitalWrite(FAN_CTL_PIN, HIGH);
+  }
+  else{
+    digitalWrite(FAN_CTL_PIN, LOW);
+  }
+}
+
+void preamp_en(uint8_t en_state){
+  delay(100);
+
+  if(en_state){
+    digitalWrite(PREAMP_CTL_PIN, HIGH);
+  }
+  else{
+    digitalWrite(PREAMP_CTL_PIN, LOW);
+  }
+
+  delay(100);
+}
 
 void rs0_raw_to_voltage(uint16_t raw_in, float* voltage_out){
 
@@ -155,6 +199,9 @@ int ad7293_init_and_configure(uint8_t pa_on){
 
   //PA on
   if(pa_on){
+    psu_en(1);
+    delay(100);
+
     data_val = (1 << PA_ON_BIT);
     ret = ad7293_spi_update_bits(ad7293_obj, AD7293_REG_PA_ON_CTRL, data_val, data_val); 
     if(ret != 0)
@@ -230,6 +277,9 @@ int ad7293_power_off(void){
   if(ret != 0)
     return ret;
 
+  delay(100);
+  psu_en(0);
+
   pa_on_state = 0;
   ad_monitoring_halt = 0;
   return 0;
@@ -259,8 +309,13 @@ void loop() {
       if(ret != 0){
         ad_monitoring_halt = 2;
       }
+      else{
+        preamp_en(1);
+      }
       
       Serial.printf("ad7293_init_and_configure() result: %d\n", ret);
+
+      fan_en(1);
 
       button1_state = 1;
     }else if(digitalRead(BUTTON1_PIN) == HIGH){
@@ -271,6 +326,8 @@ void loop() {
       Serial.printf("Powering off...\n");
 
       int ret = ad7293_power_off();
+      preamp_en(0);
+      fan_en(0);
       open_loop_enable(0);
 
       if(ret != 0){
@@ -278,7 +335,7 @@ void loop() {
       }
 
       Serial.printf("ad7293_power_off() result: %d\n", ret);
-
+    
       button2_state = 1;
     }else if(digitalRead(BUTTON2_PIN) == HIGH){
         button2_state = 0;
@@ -318,6 +375,16 @@ void setup1() {
   pinMode(LED2_PIN, OUTPUT);
   pinMode(AD_ALERT0, INPUT);
   
+  pinMode(PSU_EN_PIN, OUTPUT);
+  pinMode(PSU_PG_PIN, INPUT); 
+
+  pinMode(FAN_CTL_PIN, OUTPUT);
+  pinMode(PREAMP_CTL_PIN, OUTPUT);
+
+  psu_en(0);
+  fan_en(0);
+  preamp_en(0);
+
   int ret = ad7293_init_and_configure(0);
   Serial.printf("ad7293_init_and_configure() result: %d\n", ret);
 
@@ -359,9 +426,9 @@ void loop1() {
           digitalWrite(LED2_PIN, LOW);
         }
 
-        Serial.printf("pon: %d, olm: %d, rs0: %0.3f V, rs0_hi: %u, rs0_lo: %u, al0: %u, isense0: %0.3f A, isense1: %0.3f A, Ug0: %0.3f V (%0.3f), Ug1: %0.3f V (%0.3f)\n", 
-                pa_on_state, open_loop_mode, rs0_volts, (unsigned int)rs0_alert_high, (unsigned int)rs0_alert_low, (unsigned int)alert0_state, 
-                isense0_amps, isense1_amps, Ug0_volts, Ug0_volts_lim-Ug0_volts, Ug1_volts, Ug1_volts_lim-Ug1_volts);        
+        Serial.printf("pon: %d, pg: %d, olm: %d, rs0: %0.3f V, rs0_hi: %u, rs0_lo: %u, al0: %u, sen0: %0.3f A, sen1: %0.3f A, Ug0: %0.3f V (%0.3f), Ug1: %0.3f V (%0.3f), tmp: %0.3f degC\n", 
+                pa_on_state, psu_pg_state, open_loop_mode, rs0_volts, (unsigned int)rs0_alert_high, (unsigned int)rs0_alert_low, (unsigned int)alert0_state, 
+                isense0_amps, isense1_amps, Ug0_volts, Ug0_volts_lim-Ug0_volts, Ug1_volts, Ug1_volts_lim-Ug1_volts, temperature_degC);        
       }else if(ad_monitoring_halt == 2){
         Serial.printf("ad7293 init failed ...\n");
       }
@@ -369,6 +436,10 @@ void loop1() {
         Serial.printf("Monitoring halted...\n");
       }
 
+      psu_pg_state = (int)digitalRead(PSU_PG_PIN);
+
+      float voltage = analogRead(TEMP_SENSOR_PIN)*(3300 / 1023.0);
+      temperature_degC = voltage / 10;
 
       digitalWrite(LED0_PIN, LOW);
       delay(500);
