@@ -1,6 +1,27 @@
 #include "misc.h"
 #include "ad7293.h"
+#include <Ethernet.h>
 
+// Enter a MAC address and IP address for your controller below.
+// The IP address will be dependent on your local network.
+// gateway and subnet are optional:
+byte mac[] = {
+  0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED };
+IPAddress ip(192, 168, 0, 177);
+IPAddress myDns(192, 168, 0, 1);
+IPAddress gateway(192, 168, 0, 10);
+IPAddress subnet(255, 255, 255, 0);
+
+
+EthernetServer server(2075);
+EthernetClient clients[8];
+#define ETH_RESET_PIN 20
+
+#define RX_MAX_LEN 10
+char rx_buff[RX_MAX_LEN];
+#define CMD_MAX_LEN 3
+char cmd_buff[CMD_MAX_LEN+1];
+char response_str_buff[100];
 ////////////////////////////////////////////
 
 #define LED0_PIN 25
@@ -18,14 +39,18 @@
 
 #define TEMP_SENSOR_PIN 26 //ADC0
 
+
 struct ad7293_dev* ad7293_obj;
 uint16_t data_val;
 
-float taget_amps = 2.0;
+float taget_amps = 3.0;
 float rs0_volts;
 float isense0_amps, isense1_amps;
 float Ug0_volts, Ug1_volts;
 float Ug0_volts_lim = 0, Ug1_volts_lim = 0; 
+uint8_t rs0_alert_high = 0;
+uint8_t rs0_alert_low = 0;
+uint8_t alert0_state = 0;
 
 uint16_t rsx_alerts;
 int ad_monitoring_halt = 1;
@@ -285,24 +310,8 @@ int ad7293_power_off(void){
   return 0;
 }
 
-void setup() {
-  Serial.begin(9600);
-
-  pinMode(BUTTON1_PIN, INPUT_PULLUP);
-  pinMode(BUTTON2_PIN, INPUT_PULLUP);
-  pinMode(BUTTON3_PIN, INPUT_PULLUP);
-}
-
-
-void loop() {
-  int ret = -1;
-  uint8_t button1_state = 0;
-  uint8_t button2_state = 0;
-  uint8_t button3_state = 0;
-
-  while(1){
-
-    if((digitalRead(BUTTON1_PIN) == LOW) && (button1_state == 0)){
+void pon(uint8_t state){
+  if(state > 0){
       Serial.printf("Re-configuring...\n");
 
       int ret = ad7293_init_and_configure(1);
@@ -317,59 +326,134 @@ void loop() {
 
       fan_en(1);
 
-      button1_state = 1;
-    }else if(digitalRead(BUTTON1_PIN) == HIGH){
-        button1_state = 0;
-    }
+  }else{
 
-    if((digitalRead(BUTTON2_PIN) == LOW) && (button2_state == 0)){
-      Serial.printf("Powering off...\n");
+        Serial.printf("Powering off...\n");
 
-      int ret = ad7293_power_off();
-      preamp_en(0);
-      fan_en(0);
-      open_loop_enable(0);
-
-      if(ret != 0){
-        ad_monitoring_halt = 2;
-      }
-
-      Serial.printf("ad7293_power_off() result: %d\n", ret);
-    
-      button2_state = 1;
-    }else if(digitalRead(BUTTON2_PIN) == HIGH){
-        button2_state = 0;
-    }
-
-    if((digitalRead(BUTTON3_PIN) == LOW) && (button3_state == 0)){//this is latched button
-
-      if(open_loop_mode > 0){
+        int ret = ad7293_power_off();
+        preamp_en(0);
+        fan_en(0);
         open_loop_enable(0);
-      }else{
-        open_loop_enable(1);
+
+        if(ret != 0){
+          ad_monitoring_halt = 2;
+        }
+
+        Serial.printf("ad7293_power_off() result: %d\n", ret);
+
+  }
+
+}
+
+void setup() {
+  Serial.begin(9600);
+
+  pinMode(ETH_RESET_PIN, OUTPUT);
+  digitalWrite(ETH_RESET_PIN, LOW);
+  delay(100);
+  digitalWrite(ETH_RESET_PIN, HIGH);
+  delay(100);
+
+  Ethernet.init(17);  // WIZnet W5100S-EVB-Pico W5500-EVB-Pico W6100-EVB-Pico
+
+  // initialize the ethernet device
+  Ethernet.begin(mac, ip, myDns, gateway, subnet);
+
+  delay(5000);//this delay is just for serial port init
+
+  // Check for Ethernet hardware present
+  if (Ethernet.hardwareStatus() == EthernetNoHardware) {
+    Serial.println("Ethernet shield was not found.  Sorry, can't run without hardware. :(");
+    while (true) {
+      delay(1); // do nothing, no point running without Ethernet hardware
+    }
+  }
+  if (Ethernet.linkStatus() == LinkOFF) {
+    Serial.println("Ethernet cable is not connected.");
+  }
+
+  // start listening for clients
+  server.begin();
+
+  Serial.print("Server IP address:");
+  Serial.println(Ethernet.localIP());
+}
+
+
+void loop() {
+  // wait for a new client:
+  EthernetClient newClient = server.accept();//server.available();
+
+  if (newClient) {
+    for (byte i=0; i < 8; i++) {
+      if (!clients[i]) {
+        // Once we "accept", the client is no longer tracked by EthernetServer
+        // so we must store it into our list of clients
+        clients[i] = newClient;
+        //digitalWrite(CONNECTION_LED_PIN, HIGH);
+        break;
       }
-        
-      button3_state = 1;
-
-    }else if(digitalRead(BUTTON3_PIN) == HIGH){
-      button3_state = 0;
     }
+  }
 
+  // check for incoming data from all clients
+  for (byte i = 0; i < 8; i++) {
+    if (clients[i] && clients[i].available() > 0) {   
+      int count = clients[i].read((uint8_t*)rx_buff, RX_MAX_LEN);
 
-    if(open_loop_mode){
-      digitalWrite(LED1_PIN, HIGH);
+      memcpy(cmd_buff, rx_buff, CMD_MAX_LEN);
+      cmd_buff[CMD_MAX_LEN] = 0;
+      char cmd_type = rx_buff[CMD_MAX_LEN];//query or set command
+      char cmd_arg = rx_buff[CMD_MAX_LEN+1];//command argument
+
+      if(strcmp(cmd_buff, "mon") == 0){
+        sprintf(response_str_buff, "%d,%d,%d,%0.3f,%u,%u,%u,%0.3f,%0.3f,%0.3f,%0.3f,%0.3f,%0.3f,%0.3f\n", 
+                pa_on_state, psu_pg_state, open_loop_mode, rs0_volts, (unsigned int)rs0_alert_high, (unsigned int)rs0_alert_low, (unsigned int)alert0_state, 
+                isense0_amps, isense1_amps, Ug0_volts, Ug0_volts_lim-Ug0_volts, Ug1_volts, Ug1_volts_lim-Ug1_volts, temperature_degC);
+        clients[i].print(response_str_buff);
+      } 
+      else if(strcmp(cmd_buff, "pon") == 0){ //PA psu enable
+        if(cmd_type == '='){
+          if(cmd_arg == '0')
+            pon(0);
+          else if(cmd_arg == '1')
+            pon(1); 
+        }
+
+        sprintf(response_str_buff, "pon=%d", pa_on_state);
+        clients[i].print(response_str_buff); 
+      } 
+      else if(strcmp(cmd_buff, "olm") == 0){ //open loop mode
+        if(cmd_type == '='){
+          if(cmd_arg == '0')
+            open_loop_enable(0);
+          else if(cmd_arg == '1')
+            open_loop_enable(1);
+        }
+
+        sprintf(response_str_buff, "olm=%d", open_loop_mode);
+        clients[i].print(response_str_buff); 
+      }  
+      else
+        Serial.print("Command not supported!\n");
     }
-    else{
-      digitalWrite(LED1_PIN, LOW);
-      Ug0_volts_lim = 0;
-      Ug1_volts_lim = 0;
+  }
+
+  // stop any clients which disconnect
+  for (byte i = 0; i < 8; i++) {
+    if (clients[i] && !clients[i].connected()) {
+      //digitalWrite(CONNECTION_LED_PIN, LOW);
+      clients[i].stop();
     }
-    delay(100);     
   }
 
 }
 
 void setup1() {
+  pinMode(BUTTON1_PIN, INPUT_PULLUP);
+  pinMode(BUTTON2_PIN, INPUT_PULLUP);
+  pinMode(BUTTON3_PIN, INPUT_PULLUP); 
+
   pinMode(LED0_PIN, OUTPUT);
   pinMode(LED1_PIN, OUTPUT);
   pinMode(LED2_PIN, OUTPUT);
@@ -394,9 +478,54 @@ void setup1() {
 }
 
 void loop1() {
+    int ret = -1;
+    static uint8_t button1_state = 0;
+    static uint8_t button2_state = 0;
+    static uint8_t button3_state = 0;
+
     uint16_t adc_raw;
 
     while(1){
+
+      if((digitalRead(BUTTON1_PIN) == LOW) && (button1_state == 0)){
+        pon(1);
+
+        button1_state = 1;
+      }else if(digitalRead(BUTTON1_PIN) == HIGH){
+          button1_state = 0;
+      }
+
+      if((digitalRead(BUTTON2_PIN) == LOW) && (button2_state == 0)){
+        pon(0);
+      
+        button2_state = 1;
+      }else if(digitalRead(BUTTON2_PIN) == HIGH){
+          button2_state = 0;
+      }
+
+      if((digitalRead(BUTTON3_PIN) == LOW) && (button3_state == 0)){
+        if(open_loop_mode > 0){
+          open_loop_enable(0);
+        }else{
+          open_loop_enable(1);
+        }
+          
+        button3_state = 1;
+
+      }else if(digitalRead(BUTTON3_PIN) == HIGH){
+        button3_state = 0;
+      }
+
+
+      if(open_loop_mode){
+        digitalWrite(LED1_PIN, HIGH);
+      }
+      else{
+        digitalWrite(LED1_PIN, LOW);
+        Ug0_volts_lim = 0;
+        Ug1_volts_lim = 0;
+      }
+
       if(ad_monitoring_halt == 0){//if in halt state, ether AD is not ready or is used in other loop
         ad7293_spi_read(ad7293_obj, AD7293_REG_RS0_MON, &adc_raw);
         rs0_raw_to_voltage(adc_raw, &rs0_volts);
@@ -414,10 +543,10 @@ void loop1() {
         bi_vout_raw_to_voltage(adc_raw, &Ug1_volts);
 
         ad7293_spi_read(ad7293_obj, AD7293_REG_RSX_MON_ALERT, &rsx_alerts);
-        uint8_t rs0_alert_high = (rsx_alerts>>8)&0x1;
-        uint8_t rs0_alert_low = (rsx_alerts>>0)&0x1;
+        rs0_alert_high = (rsx_alerts>>8)&0x1;
+        rs0_alert_low = (rsx_alerts>>0)&0x1;
+        alert0_state = 0;
 
-        uint8_t alert0_state = 0;
         if(digitalRead(AD_ALERT0)){
           alert0_state = 1;
           pa_on_state = 0;
